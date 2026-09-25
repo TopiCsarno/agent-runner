@@ -6,6 +6,8 @@ import argparse
 import json
 import os
 import re
+import selectors
+import socket
 import subprocess
 import sys
 import tempfile
@@ -23,10 +25,12 @@ RUNNABLE_STATUS = "ready-for-agent"
 DEFAULT_EFFORT = "default"
 DEFAULT_MODEL = "OpenCode default"
 COMPLETION_INSTRUCTION = (
-    "Implement the issue and keep its Status field unchanged while working; do not mark "
-    "it completed. Before exiting, update its Markdown file so every checklist item is "
-    "checked (`- [x]`). The issue runner marks it completed after this process exits "
-    "successfully. Do not finish while any checkbox remains unchecked."
+    "Implement the issue. Before exiting, update the issue tracker in its Markdown file: "
+    "mark every acceptance-criteria checklist item that is satisfied as checked (`- [x]`) "
+    "and set its Status field (or frontmatter `status`) to `completed`. Do not merely "
+    "describe this in your final response; edit the issue file. Re-read the file before "
+    "exiting and do not finish while any checklist item remains unchecked. The runner "
+    "validates the checklist and accepts an already-completed status."
 )
 USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 RESET = "\033[0m"
@@ -57,6 +61,18 @@ class OpenCodeSettings:
     effort: str
 
 
+@dataclass
+class ProcessState:
+    issue: Issue
+    started_at: datetime
+    started_clock: float
+    output: BinaryIO
+    log_path: Path
+    display_buffer: str = ""
+    session_id: str | None = None
+    stream_closed: bool = False
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run ready issue files through OpenCode in dependency order."
@@ -76,6 +92,21 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="print the preflight details without running issues",
+    )
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        help="run directory for logs and session metadata (default: user cache)",
+    )
+    parser.add_argument(
+        "--follow",
+        metavar="ISSUE",
+        help="follow a running issue log instead of starting issues",
+    )
+    parser.add_argument(
+        "--attach",
+        metavar="ISSUE",
+        help="open the OpenCode session for an issue instead of starting issues",
     )
     return parser.parse_args()
 
@@ -497,12 +528,221 @@ def print_issue_failure(
     print("\n".join(f"    {line}" for line in detail.splitlines()), flush=True)
 
 
-def read_failure_output(output: BinaryIO) -> str:
-    output.seek(0)
-    detail = output.read().decode("utf-8", errors="replace").strip()
-    if len(detail) <= 4000:
-        return detail
-    return "... output truncated ...\n" + detail[-4000:]
+def default_run_root() -> Path:
+    cache_home = Path(
+        os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")
+    )
+    return cache_home / "yapcap-agent-runner"
+
+
+def create_run_dir(requested: Path | None) -> Path:
+    if requested is None:
+        timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
+        requested = default_run_root() / f"run-{timestamp}-{os.getpid()}"
+    requested.mkdir(parents=True, exist_ok=True)
+    manifest = requested / "manifest.json"
+    if manifest.exists():
+        raise ValueError(f"run directory already contains a manifest: {requested}")
+    return requested.resolve()
+
+
+def latest_run_dir() -> Path:
+    candidates = sorted(
+        path
+        for path in default_run_root().glob("run-*")
+        if path.is_dir() and (path / "manifest.json").is_file()
+    )
+    if not candidates:
+        raise ValueError(f"no runner runs found under {default_run_root()}")
+    return candidates[-1]
+
+
+def write_manifest(run_dir: Path, manifest: dict[str, object]) -> None:
+    path = run_dir / "manifest.json"
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    temporary_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary_path, path)
+
+
+def read_manifest(run_dir: Path) -> dict[str, object]:
+    path = run_dir / "manifest.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise ValueError(f"cannot read runner manifest {path}: {error}") from error
+    except json.JSONDecodeError as error:
+        raise ValueError(f"runner manifest is invalid: {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"runner manifest is not an object: {path}")
+    return value
+
+
+def resolve_run_dir(requested: Path | None) -> Path:
+    return requested if requested is not None else latest_run_dir()
+
+
+def issue_record(
+    manifest: dict[str, object], issue_ref: str
+) -> tuple[str, dict[str, object]]:
+    issues = manifest.get("issues")
+    if not isinstance(issues, dict):
+        raise ValueError("runner manifest has no issue records")
+    if issue_ref in issues and isinstance(issues[issue_ref], dict):
+        return issue_ref, issues[issue_ref]
+    for key, value in issues.items():
+        if isinstance(value, dict) and (
+            value.get("number") == issue_ref or value.get("relative_path") == issue_ref
+        ):
+            return key, value
+    raise ValueError(f"issue {issue_ref} is not present in runner manifest")
+
+
+def follow_issue(run_dir: Path, issue_ref: str) -> int:
+    manifest = read_manifest(run_dir)
+    key, record = issue_record(manifest, issue_ref)
+    log_value = record.get("log")
+    if not isinstance(log_value, str):
+        raise ValueError(f"issue {key} has no log path in runner manifest")
+    log_path = Path(log_value)
+    if not log_path.is_absolute():
+        log_path = run_dir / log_path
+    print(f"following issue {key}: {log_path}")
+    position = 0
+    while True:
+        try:
+            with log_path.open("r", encoding="utf-8", errors="replace") as log:
+                log.seek(position)
+                while line := log.readline():
+                    print(line, end="")
+                position = log.tell()
+        except FileNotFoundError:
+            pass
+        manifest = read_manifest(run_dir)
+        _, record = issue_record(manifest, key)
+        if record.get("status") in {"finished", "failed", "aborted"}:
+            return 1 if record.get("status") != "finished" else 0
+        time.sleep(0.25)
+
+
+def attach_issue(opencode: str, run_dir: Path, issue_ref: str) -> int:
+    manifest = read_manifest(run_dir)
+    key, record = issue_record(manifest, issue_ref)
+    if record.get("status") != "running":
+        raise ValueError(f"issue {key} is not running; use --follow to inspect its log")
+    session_id = record.get("session_id")
+    server_url = manifest.get("server_url")
+    if not isinstance(session_id, str):
+        raise ValueError(f"issue {key} does not have a discovered OpenCode session yet")
+    if not isinstance(server_url, str):
+        raise ValueError("runner manifest has no OpenCode server URL")
+    print(f"attaching to issue {key} session {session_id}")
+    return subprocess.run(
+        [opencode, "attach", server_url, "--session", session_id],
+        check=False,
+    ).returncode
+
+
+def start_server(opencode: str) -> tuple[subprocess.Popen[bytes], str]:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    process = subprocess.Popen(
+        [
+            opencode,
+            "serve",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    server_url = f"http://127.0.0.1:{port}"
+    for _ in range(100):
+        if process.poll() is not None:
+            raise ValueError("OpenCode server exited before becoming ready")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                return process, server_url
+        except OSError:
+            time.sleep(0.05)
+    process.terminate()
+    process.wait()
+    raise ValueError(f"OpenCode server did not become ready: {server_url}")
+
+
+def stop_server(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def extract_session_id(line: str) -> str | None:
+    try:
+        value = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    for key in ("sessionID", "sessionId", "session_id"):
+        session_id = value.get(key)
+        if isinstance(session_id, str) and session_id:
+            return session_id
+    return None
+
+
+def consume_output(
+    state: ProcessState,
+    chunk: bytes,
+    manifest: dict[str, object],
+    run_dir: Path,
+) -> None:
+    state.output.write(chunk)
+    state.output.flush()
+    state.display_buffer += chunk.decode("utf-8", errors="replace")
+    lines = state.display_buffer.splitlines(keepends=True)
+    state.display_buffer = ""
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        state.display_buffer = lines.pop()
+    for line in lines:
+        process_output_line(state, line, manifest, run_dir)
+
+
+def process_output_line(
+    state: ProcessState,
+    line: str,
+    manifest: dict[str, object],
+    run_dir: Path,
+) -> None:
+    session_id = extract_session_id(line)
+    if not session_id or session_id == state.session_id:
+        return
+    state.session_id = session_id
+    record = manifest["issues"][str(state.issue.number)]
+    record["session_id"] = session_id
+    write_manifest(run_dir, manifest)
+    print(
+        f"issue {state.issue.number} session: {session_id}\n"
+        f"  attach: opencode attach {manifest['server_url']} "
+        f"--session {session_id}",
+        flush=True,
+    )
+
+
+def flush_output(
+    state: ProcessState,
+    manifest: dict[str, object],
+    run_dir: Path,
+) -> None:
+    if state.display_buffer:
+        process_output_line(state, state.display_buffer, manifest, run_dir)
+        state.display_buffer = ""
 
 
 def load_opencode_settings(opencode: str) -> OpenCodeSettings:
@@ -604,7 +844,11 @@ def mark_completed(issue: Issue) -> None:
         raise ValueError(f"issue {issue.number} has unchecked checklist items")
     updated = replace_status(text)
     if updated == text:
-        raise ValueError(f"issue {issue.number} has no status field")
+        current = read_issue(issue.path, issue.path.parent, issue.number)
+        if current.status not in COMPLETED_STATUSES:
+            raise ValueError(f"issue {issue.number} has no status field")
+        issue.status = "completed"
+        return
     mode = issue.path.stat().st_mode
     temporary_path: Path | None = None
     try:
@@ -657,9 +901,31 @@ def run_issues(
     opencode: str,
     model: str | None = None,
     effort: str | None = None,
+    requested_run_dir: Path | None = None,
 ) -> int:
-    running: dict[subprocess.Popen[bytes], tuple[Issue, datetime, float, BinaryIO]] = {}
+    run_dir = create_run_dir(requested_run_dir)
+    server_process, server_url = start_server(opencode)
+    manifest: dict[str, object] = {
+        "run_id": run_dir.name,
+        "started_at": datetime.now().astimezone().isoformat(),
+        "server_url": server_url,
+        "issues": {
+            str(issue.number): {
+                "number": str(issue.number),
+                "relative_path": issue.relative_path,
+                "name": display_name(issue),
+                "status": "pending",
+                "session_id": None,
+            }
+            for issue in issues
+        },
+    }
+    write_manifest(run_dir, manifest)
+    print(f"run directory: {run_dir}")
+    print(f"OpenCode server: {server_url}")
+    running: dict[subprocess.Popen[bytes], ProcessState] = {}
     failed: set[int] = set()
+    output_selector = selectors.DefaultSelector()
 
     try:
         while True:
@@ -667,15 +933,19 @@ def run_issues(
                 if issue.number in failed or issue.status in COMPLETED_STATUSES:
                     continue
                 if all(
-                    running_issue is not issue
-                    for running_issue, _, _, _ in running.values()
+                    state.issue is not issue for state in running.values()
                 ) and can_start(issue):
                     started_at = datetime.now().astimezone()
                     print_issue_event("started", issue, started_at)
-                    output = tempfile.TemporaryFile()
+                    log_path = run_dir / f"issue-{issue.number}.log"
+                    output = log_path.open("w+b")
                     command = [
                         opencode,
                         "run",
+                        "--attach",
+                        server_url,
+                        "--format",
+                        "json",
                         "--command",
                         "implement",
                     ]
@@ -687,22 +957,45 @@ def run_issues(
                     try:
                         process = subprocess.Popen(
                             command,
-                            stdout=output,
+                            stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT,
                         )
                     except OSError as error:
                         output.close()
                         failed.add(issue.number)
+                        record = manifest["issues"][str(issue.number)]
+                        record.update(
+                            {
+                                "status": "failed",
+                                "log": str(log_path),
+                                "error": str(error),
+                            }
+                        )
+                        write_manifest(run_dir, manifest)
                         print_issue_failure(
                             issue, datetime.now().astimezone(), 0, 0, str(error)
                         )
                     else:
-                        running[process] = (
-                            issue,
-                            started_at,
-                            time.monotonic(),
-                            output,
+                        state = ProcessState(
+                            issue=issue,
+                            started_at=started_at,
+                            started_clock=time.monotonic(),
+                            output=output,
+                            log_path=log_path,
                         )
+                        running[process] = state
+                        output_selector.register(process.stdout, selectors.EVENT_READ, process)
+                        record = manifest["issues"][str(issue.number)]
+                        record.update(
+                            {
+                                "status": "running",
+                                "pid": process.pid,
+                                "log": str(log_path),
+                                "started_at": started_at.isoformat(),
+                            }
+                        )
+                        write_manifest(run_dir, manifest)
+                        print(f"  log: {log_path}", flush=True)
 
             if not running:
                 unfinished = [
@@ -720,49 +1013,95 @@ def run_issues(
                         print(f"issue blocked: {issue.number}")
                 return 1 if failed else 0
 
-            time.sleep(0.2)
-            for process, (issue, _, started_clock, output) in list(running.items()):
+            for selected, _ in output_selector.select(timeout=0.2):
+                process = selected.data
+                state = running.get(process)
+                if state is None:
+                    continue
+                chunk = os.read(selected.fileobj.fileno(), 65536)
+                if chunk:
+                    consume_output(state, chunk, manifest, run_dir)
+                else:
+                    output_selector.unregister(selected.fileobj)
+                    state.stream_closed = True
+
+            for process, state in list(running.items()):
                 return_code = process.poll()
-                if return_code is None:
+                if return_code is None or not state.stream_closed:
                     continue
                 del running[process]
                 finished_at = datetime.now().astimezone()
-                elapsed = time.monotonic() - started_clock
+                flush_output(state, manifest, run_dir)
+                elapsed = time.monotonic() - state.started_clock
+                record = manifest["issues"][str(state.issue.number)]
+                record.update(
+                    {
+                        "finished_at": finished_at.isoformat(),
+                        "return_code": return_code,
+                    }
+                )
                 if return_code != 0:
-                    failed.add(issue.number)
+                    failed.add(state.issue.number)
+                    record["status"] = "failed"
+                    write_manifest(run_dir, manifest)
+                    state.output.flush()
                     print_issue_failure(
-                        issue,
+                        state.issue,
                         finished_at,
                         elapsed,
                         return_code,
-                        read_failure_output(output),
+                        f"OpenCode exited with status {return_code}; log: {state.log_path}",
                     )
-                    output.close()
+                    state.output.close()
                     continue
                 try:
-                    mark_completed(issue)
+                    mark_completed(state.issue)
                 except (OSError, ValueError) as error:
-                    failed.add(issue.number)
+                    failed.add(state.issue.number)
+                    record["status"] = "failed"
+                    record["error"] = str(error)
+                    write_manifest(run_dir, manifest)
                     print_issue_failure(
-                        issue,
+                        state.issue,
                         datetime.now().astimezone(),
                         elapsed,
                         0,
                         str(error),
                     )
-                    output.close()
+                    state.output.close()
                     continue
-                output.close()
-                print_issue_event("finished", issue, finished_at, elapsed)
+                record["status"] = "finished"
+                write_manifest(run_dir, manifest)
+                state.output.close()
+                print_issue_event("finished", state.issue, finished_at, elapsed)
     except KeyboardInterrupt:
-        for process, (_, _, _, output) in running.items():
+        for process, state in running.items():
             process.terminate()
-            output.close()
+            state.output.close()
+            record = manifest["issues"][str(state.issue.number)]
+            record["status"] = "aborted"
+        write_manifest(run_dir, manifest)
         raise
+    finally:
+        output_selector.close()
+        for process, state in running.items():
+            if process.poll() is None:
+                process.terminate()
+            state.output.close()
+        stop_server(server_process)
 
 
 def main() -> int:
     arguments = parse_args()
+    if arguments.follow or arguments.attach:
+        try:
+            run_dir = resolve_run_dir(arguments.run_dir)
+            if arguments.follow:
+                return follow_issue(run_dir, arguments.follow)
+            return attach_issue(arguments.opencode, run_dir, arguments.attach)
+        except (OSError, ValueError) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 2
     issues_dir = Path(arguments.issues_dir)
     if not issues_dir.is_dir():
         print(f"issues directory not found: {issues_dir}", file=sys.stderr)
@@ -809,7 +1148,13 @@ def main() -> int:
         if not confirm_run():
             return 0
         model_arg = None if selected_model == DEFAULT_MODEL else selected_model
-        return run_issues(issues, arguments.opencode, model_arg, selected_effort)
+        return run_issues(
+            issues,
+            arguments.opencode,
+            model_arg,
+            selected_effort,
+            arguments.run_dir,
+        )
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
